@@ -734,6 +734,26 @@ def _rate_limit_progress_suffix() -> str:
     wait = snapshot.get("secondsUntilNextRequest")
     if isinstance(wait, (int, float)) and wait > 0:
         parts.append(f"next request in {float(wait):.1f}s")
+    soft_delay = snapshot.get("softThrottleDelaySeconds")
+    soft_threshold = snapshot.get("softThrottleThreshold")
+    initial_limit = snapshot.get("xRateLimitInitialLimit")
+    limit_vs_initial = snapshot.get("xRateLimitLimitVsInitial")
+    initial_limit_trigger = snapshot.get("softThrottleInitialLimitPercent")
+    if isinstance(initial_limit, int) and initial_limit > 0 and isinstance(limit, int) and limit > 0:
+        if isinstance(limit_vs_initial, (int, float)):
+            parts.append(f"limit {limit}/{initial_limit} init ({float(limit_vs_initial) * 100:.0f}%)")
+        else:
+            parts.append(f"limit {limit}/{initial_limit} init")
+    if isinstance(soft_delay, (int, float)) and soft_delay > 0:
+        if isinstance(soft_threshold, (int, float)) and soft_threshold > 0:
+            if isinstance(initial_limit_trigger, (int, float)) and initial_limit_trigger > 0:
+                parts.append(
+                    f"soft delay {float(soft_delay):.2f}s (<{float(soft_threshold) * 100:.0f}% rem or <{float(initial_limit_trigger) * 100:.0f}% init limit)"
+                )
+            else:
+                parts.append(f"soft delay {float(soft_delay):.2f}s (<{float(soft_threshold) * 100:.0f}% rem)")
+        else:
+            parts.append(f"soft delay {float(soft_delay):.2f}s")
     resource = snapshot.get("xRateLimitResource")
     if isinstance(resource, str) and resource.strip():
         parts.append(f"resource {resource.strip()}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 import threading
 import time
@@ -14,6 +15,30 @@ import requests
 _RATE_LIMIT_LOCK = threading.Lock()
 _NEXT_REQUEST_NOT_BEFORE = 0.0
 _LAST_RATE_LIMIT: dict[str, Any] = {}
+_INITIAL_RATE_LIMIT_BY_RESOURCE: dict[str, int] = {}
+
+
+def _read_env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _load_soft_throttle_settings() -> tuple[float, float, float]:
+    threshold = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_THRESHOLD", 0.35)
+    max_delay = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS", 3.0)
+    initial_limit_percent = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT", 0.80)
+    threshold = max(0.0, min(1.0, threshold))
+    max_delay = max(0.0, max_delay)
+    initial_limit_percent = max(0.0, min(1.0, initial_limit_percent))
+    return threshold, max_delay, initial_limit_percent
+
+
+_SOFT_THROTTLE_THRESHOLD, _SOFT_THROTTLE_MAX_DELAY_SECONDS, _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT = _load_soft_throttle_settings()
 
 
 @dataclass(frozen=True)
@@ -305,6 +330,7 @@ class AzureDevOpsClient:
         attempts = 4 if retry_transient else 1
         for attempt in range(1, attempts + 1):
             _wait_for_rate_limit_window()
+            _wait_for_soft_throttle_window()
             try:
                 response = self.session.request(method, url, timeout=60, **kwargs)
             except requests.RequestException:
@@ -404,23 +430,66 @@ def _record_rate_limit_hints(response: requests.Response) -> None:
     x_reset = _header_float(response, "X-RateLimit-Reset")
     x_cost = _header_float(response, "X-RateLimit-Cost")
     x_resource = response.headers.get("X-RateLimit-Resource")
+    resource_key = (x_resource or "default").strip().lower()
 
     delay = _rate_limit_delay_seconds(response)
     with _RATE_LIMIT_LOCK:
-        global _NEXT_REQUEST_NOT_BEFORE, _LAST_RATE_LIMIT
+        global _NEXT_REQUEST_NOT_BEFORE, _LAST_RATE_LIMIT, _INITIAL_RATE_LIMIT_BY_RESOURCE
+        if isinstance(x_limit, int) and x_limit > 0 and resource_key and resource_key not in _INITIAL_RATE_LIMIT_BY_RESOURCE:
+            _INITIAL_RATE_LIMIT_BY_RESOURCE[resource_key] = x_limit
+        initial_limit = _INITIAL_RATE_LIMIT_BY_RESOURCE.get(resource_key)
+        limit_vs_initial = None
+        if isinstance(initial_limit, int) and initial_limit > 0 and isinstance(x_limit, int) and x_limit > 0:
+            limit_vs_initial = x_limit / initial_limit
         _LAST_RATE_LIMIT = {
             "recordedAt": now,
             "retryAfterSeconds": retry_after,
             "xRateLimitDelaySeconds": x_delay,
             "xRateLimitRemaining": x_remaining,
             "xRateLimitLimit": x_limit,
+            "xRateLimitInitialLimit": initial_limit,
+            "xRateLimitLimitVsInitial": limit_vs_initial,
             "xRateLimitReset": x_reset,
             "xRateLimitCost": x_cost,
             "xRateLimitResource": x_resource,
             "appliedDelaySeconds": delay,
+            "softThrottleDelaySeconds": 0.0,
+            "softThrottleThreshold": _SOFT_THROTTLE_THRESHOLD,
+            "softThrottleMaxDelaySeconds": _SOFT_THROTTLE_MAX_DELAY_SECONDS,
+            "softThrottleInitialLimitPercent": _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT,
         }
         if delay > 0:
             _NEXT_REQUEST_NOT_BEFORE = max(_NEXT_REQUEST_NOT_BEFORE, now + delay)
+
+
+def _compute_soft_throttle_delay(snapshot: dict[str, Any]) -> float:
+    if _SOFT_THROTTLE_THRESHOLD <= 0 or _SOFT_THROTTLE_MAX_DELAY_SECONDS <= 0:
+        return 0.0
+
+    remaining = snapshot.get("xRateLimitRemaining")
+    limit = snapshot.get("xRateLimitLimit")
+    if not isinstance(remaining, int) or not isinstance(limit, int) or limit <= 0:
+        return 0.0
+    if remaining <= 0:
+        return 0.0
+
+    ratio = remaining / limit
+    ratio_delay = 0.0
+    if ratio < _SOFT_THROTTLE_THRESHOLD:
+        pressure = (_SOFT_THROTTLE_THRESHOLD - ratio) / _SOFT_THROTTLE_THRESHOLD
+        pressure = max(0.0, min(1.0, pressure))
+        ratio_delay = _SOFT_THROTTLE_MAX_DELAY_SECONDS * pressure
+
+    initial_limit = snapshot.get("xRateLimitInitialLimit")
+    initial_limit_delay = 0.0
+    if isinstance(initial_limit, int) and initial_limit > 0 and _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT > 0:
+        limit_vs_initial = limit / initial_limit
+        if limit_vs_initial < _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT:
+            drop_pressure = (_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT - limit_vs_initial) / _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT
+            drop_pressure = max(0.0, min(1.0, drop_pressure))
+            initial_limit_delay = _SOFT_THROTTLE_MAX_DELAY_SECONDS * max(0.15, drop_pressure)
+
+    return max(ratio_delay, initial_limit_delay)
 
 
 def _wait_for_rate_limit_window() -> None:
@@ -430,6 +499,23 @@ def _wait_for_rate_limit_window() -> None:
         if wait_seconds <= 0:
             return
         time.sleep(min(wait_seconds, 1.0))
+
+
+def _wait_for_soft_throttle_window() -> None:
+    with _RATE_LIMIT_LOCK:
+        snapshot = dict(_LAST_RATE_LIMIT) if _LAST_RATE_LIMIT else None
+    if not snapshot:
+        return
+
+    delay = _compute_soft_throttle_delay(snapshot)
+    with _RATE_LIMIT_LOCK:
+        if _LAST_RATE_LIMIT:
+            _LAST_RATE_LIMIT["softThrottleDelaySeconds"] = delay
+            _LAST_RATE_LIMIT["softThrottleThreshold"] = _SOFT_THROTTLE_THRESHOLD
+            _LAST_RATE_LIMIT["softThrottleMaxDelaySeconds"] = _SOFT_THROTTLE_MAX_DELAY_SECONDS
+            _LAST_RATE_LIMIT["softThrottleInitialLimitPercent"] = _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT
+    if delay > 0:
+        time.sleep(delay)
 
 
 def get_rate_limit_snapshot() -> dict[str, Any] | None:
