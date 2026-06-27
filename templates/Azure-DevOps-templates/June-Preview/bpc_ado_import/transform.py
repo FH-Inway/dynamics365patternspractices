@@ -184,6 +184,12 @@ def _fields(
             continue
         fields[ref] = value
 
+    # Some process templates require Priority on Scenario and System process items.
+    priority_ref = "Microsoft.VSTS.Common.Priority"
+    if wit.lower() in {"scenario", "system process"} and priority_ref not in fields:
+        if applicable is None or priority_ref in applicable:
+            fields[priority_ref] = 2
+
     return {ref: value for ref, value in fields.items() if value not in (None, "")}
 
 
