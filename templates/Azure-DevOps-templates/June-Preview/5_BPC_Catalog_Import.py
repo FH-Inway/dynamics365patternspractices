@@ -45,6 +45,8 @@ def main() -> int:
     ]
     if os.getenv("BPC_ADO_INCLUDE_DEPRECATED_DELETED", "").strip().lower() in ("1", "true", "yes"):
         argv.append("--include-deprecated-deleted")
+    if os.getenv("BPC_ADO_IMPORT_SKIP_UNKNOWN_FIELDS", "").strip().lower() in ("1", "true", "yes"):
+        argv.append("--skip-unknown-fields")
     return importer_main(argv)
 
 

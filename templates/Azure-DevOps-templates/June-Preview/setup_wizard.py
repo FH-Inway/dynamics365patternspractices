@@ -77,6 +77,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel worker count for phase 5 catalog import. Defaults to BPC_ADO_IMPORT_PARALLEL_WORKERS or 4.",
     )
     parser.add_argument(
+        "--skip-unknown-fields",
+        action="store_true",
+        help="For phase 5 only: drop fields that do not exist in the target project.",
+    )
+    parser.add_argument(
         "--skip-excel-validation",
         action="store_true",
         help="Skip the early Excel workbook validation check.",
@@ -178,6 +183,7 @@ def _phase_env(config: AdoSetupConfig, args: argparse.Namespace) -> Dict[str, st
             "BPC_ADO_CATALOG_SOURCE_DIR": args.catalog_source_dir or _default_catalog_source(config.excel_file),
             "BPC_ADO_IMPORT_OUTPUT": args.catalog_output or os.path.join(SCRIPT_DIR, "out"),
             "BPC_ADO_IMPORT_PARALLEL_WORKERS": str(args.catalog_parallel_workers),
+            "BPC_ADO_IMPORT_SKIP_UNKNOWN_FIELDS": "1" if args.skip_unknown_fields else "0",
         }
     )
     return env
