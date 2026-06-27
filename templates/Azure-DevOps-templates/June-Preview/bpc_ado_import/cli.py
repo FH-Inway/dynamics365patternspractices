@@ -19,6 +19,9 @@ from .sources import find_source_files, load_rows
 from .transform import WorkItemDraft, build_drafts
 
 
+REQUIRED_FIELD_FALLBACKS: dict[str, Any] = {}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Import Business Process Catalog files into Azure DevOps.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -420,6 +423,21 @@ def _create_draft(
             recovery_field=args.recovery_field,
         )
     except RuntimeError as exc:
+        fallback = _required_field_fallback(client, [work_item_type, draft.work_item_type], fields, str(exc))
+        if fallback is not None:
+            fallback_fields, fallback_ref, fallback_value = fallback
+            result = client.create_work_item(
+                work_item_type,
+                fallback_fields,
+                parent_id,
+                args.dry_run,
+                max_retries=args.max_retries,
+                retry_delay_seconds=args.retry_delay_seconds,
+                recovery_field=args.recovery_field,
+            )
+            result["requiredFieldFallback"] = fallback_ref
+            result["requiredFieldFallbackValue"] = fallback_value
+            return result
         if not _is_invalid_state_create_error(exc) or "System.State" not in fields:
             raise
         desired_state = fields["System.State"]
@@ -442,6 +460,65 @@ def _create_draft(
             except RuntimeError as update_exc:
                 result["stateUpdateWarning"] = str(update_exc)
         return result
+
+
+def _required_field_fallback(
+    client: AzureDevOpsClient,
+    work_item_types: list[str],
+    fields: dict[str, Any],
+    error_text: str,
+) -> tuple[dict[str, Any], str, Any] | None:
+    if not _is_field_value_retry_error(error_text):
+        return None
+    invalid_value = _invalid_list_value_from_error(error_text)
+    refs = re.findall(r'"fieldReferenceName":"([^"]+)"', error_text)
+    wit_candidates = [w for w in work_item_types if w]
+    for ref in refs:
+        current = fields.get(ref)
+        candidates: list[Any] = []
+        for wit in wit_candidates:
+            try:
+                candidates.extend(client.get_allowed_values(wit, ref))
+            except Exception:
+                continue
+        configured = REQUIRED_FIELD_FALLBACKS.get(ref)
+        if configured not in (None, ""):
+            candidates.append(configured)
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate in (None, "") or candidate == current:
+                continue
+            if invalid_value is not None and str(candidate).strip() == invalid_value:
+                continue
+            updated = dict(fields)
+            updated[ref] = candidate
+            return updated, ref, candidate
+    return None
+
+
+def _is_field_value_retry_error(error_text: str) -> bool:
+    text = error_text.lower()
+    return (
+        '"fieldreferencename":"' in text
+        and (
+            "required" in text
+            or "invalidempty" in text
+            or "invalidlistvalue" in text
+            or "not in the list of supported values" in text
+        )
+    )
+
+
+def _invalid_list_value_from_error(error_text: str) -> str | None:
+    match = re.search(r"contains the value '([^']+)'", error_text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
 
 
 def _print_create_result(args: argparse.Namespace, draft: WorkItemDraft, result: dict[str, Any]) -> None:

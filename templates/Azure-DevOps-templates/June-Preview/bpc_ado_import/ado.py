@@ -60,6 +60,91 @@ class AzureDevOpsClient:
             refs[reference_name] = reference_name
         return refs
 
+    def get_allowed_values(self, work_item_type: str, field_ref: str) -> list[str]:
+        wit = quote(work_item_type)
+        ref = quote(field_ref, safe="")
+        url = self._url(f"_apis/wit/workitemtypes/{wit}/fields/{ref}?api-version={self.api_version}")
+        data = self._request("GET", url).json()
+        values = data.get("allowedValues") or []
+        if not values:
+            values = self.get_work_item_type_field_allowed_values(work_item_type, field_ref)
+        if not values:
+            return self.get_field_allowed_values(field_ref)
+        normalized: list[str] = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def get_work_item_type_field_allowed_values(self, work_item_type: str, field_ref: str) -> list[str]:
+        wit = quote(work_item_type)
+        url = self._url(f"_apis/wit/workitemtypes/{wit}/fields?api-version={self.api_version}")
+        data = self._request("GET", url).json()
+        target = field_ref.strip().lower()
+        for item in data.get("value", []) or []:
+            reference_name = str(item.get("referenceName") or "").strip().lower()
+            if reference_name != target:
+                continue
+            values = item.get("allowedValues") or []
+            normalized: list[str] = []
+            for value in values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    normalized.append(text)
+            return normalized
+        return []
+
+    def get_field_allowed_values(self, field_ref: str) -> list[str]:
+        ref = quote(field_ref, safe="")
+        url = self._url(f"_apis/wit/fields/{ref}?api-version={self.api_version}")
+        data = self._request("GET", url).json()
+        values = data.get("allowedValues") or []
+        if not values:
+            picklist_id = data.get("picklistId")
+            if picklist_id:
+                values = self.get_picklist_values(str(picklist_id))
+        normalized: list[str] = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def get_picklist_values(self, picklist_id: str) -> list[str]:
+        pid = quote(str(picklist_id).strip(), safe="")
+        values = self._get_picklist_values_via_wit(pid)
+        if values:
+            return values
+        return self._get_picklist_values_via_processes_lists(pid)
+
+    def _get_picklist_values_via_wit(self, picklist_id: str) -> list[str]:
+        url = f"{self.project.organization_url}/_apis/wit/picklists/{picklist_id}?api-version={self.api_version}"
+        try:
+            data = self._request("GET", url).json()
+        except Exception:
+            return []
+        values = data.get("items") or []
+        return _normalize_string_values(values)
+
+    def _get_picklist_values_via_processes_lists(self, picklist_id: str) -> list[str]:
+        url = (
+            f"{self.project.organization_url}/_apis/work/processes/lists/{picklist_id}"
+            f"?api-version={self.api_version}-preview.1"
+        )
+        try:
+            data = self._request("GET", url).json()
+        except Exception:
+            return []
+        values = data.get("items") or []
+        return _normalize_string_values(values)
+
     def ensure_classification_path(self, structure_group: str, tree_path: str) -> None:
         parts = [p for p in tree_path.split("\\") if p]
         if not parts:
@@ -260,3 +345,14 @@ def _retry_after_seconds(response: requests.Response) -> float | None:
 
 def _wiql_quote(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _normalize_string_values(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    return normalized
