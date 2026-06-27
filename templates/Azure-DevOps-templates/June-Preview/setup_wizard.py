@@ -71,7 +71,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-after", type=int, choices=[1, 2, 3, 4, 5, 6], default=6, help="Last phase to run.")
     parser.add_argument("--catalog-source-dir", help="Folder containing the four BPC source files. Defaults to the parent folder of a 'Python Scripts' template folder.")
     parser.add_argument("--catalog-output", help="Base output folder for phase 5 import logs and ID maps.")
-    parser.add_argument("--catalog-parallel-workers", default="4", help="Parallel worker count for phase 5 catalog import.")
+    parser.add_argument(
+        "--catalog-parallel-workers",
+        default=os.getenv("BPC_ADO_IMPORT_PARALLEL_WORKERS", "4"),
+        help="Parallel worker count for phase 5 catalog import. Defaults to BPC_ADO_IMPORT_PARALLEL_WORKERS or 4.",
+    )
     parser.add_argument(
         "--skip-excel-validation",
         action="store_true",
