@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import base64
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import requests
+
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_NEXT_REQUEST_NOT_BEFORE = 0.0
+_LAST_RATE_LIMIT: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -298,6 +304,7 @@ class AzureDevOpsClient:
     def _request(self, method: str, url: str, retry_transient: bool = True, **kwargs: Any) -> requests.Response:
         attempts = 4 if retry_transient else 1
         for attempt in range(1, attempts + 1):
+            _wait_for_rate_limit_window()
             try:
                 response = self.session.request(method, url, timeout=60, **kwargs)
             except requests.RequestException:
@@ -305,6 +312,7 @@ class AzureDevOpsClient:
                     raise
                 time.sleep(2 * attempt)
                 continue
+            _record_rate_limit_hints(response)
             if response.status_code < 400:
                 return response
             if retry_transient and _is_transient_status(response.status_code) and attempt < attempts:
@@ -341,6 +349,97 @@ def _retry_after_seconds(response: requests.Response) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _header_float(response: requests.Response, name: str) -> float | None:
+    value = response.headers.get(name)
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _header_int(response: requests.Response, name: str) -> int | None:
+    value = response.headers.get(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _rate_limit_delay_seconds(response: requests.Response) -> float:
+    delay_candidates: list[float] = []
+
+    retry_after = _retry_after_seconds(response)
+    if retry_after and retry_after > 0:
+        delay_candidates.append(retry_after)
+
+    x_delay = _header_float(response, "X-RateLimit-Delay")
+    if x_delay and x_delay > 0:
+        delay_candidates.append(x_delay)
+
+    remaining = _header_int(response, "X-RateLimit-Remaining")
+    if remaining == 0:
+        reset_epoch = _header_float(response, "X-RateLimit-Reset")
+        if reset_epoch:
+            reset_delay = max(0.0, reset_epoch - time.time())
+            if reset_delay > 0:
+                delay_candidates.append(reset_delay)
+
+    if not delay_candidates:
+        return 0.0
+    return max(delay_candidates)
+
+
+def _record_rate_limit_hints(response: requests.Response) -> None:
+    now = time.time()
+    retry_after = _retry_after_seconds(response)
+    x_delay = _header_float(response, "X-RateLimit-Delay")
+    x_remaining = _header_int(response, "X-RateLimit-Remaining")
+    x_limit = _header_int(response, "X-RateLimit-Limit")
+    x_reset = _header_float(response, "X-RateLimit-Reset")
+    x_cost = _header_float(response, "X-RateLimit-Cost")
+    x_resource = response.headers.get("X-RateLimit-Resource")
+
+    delay = _rate_limit_delay_seconds(response)
+    with _RATE_LIMIT_LOCK:
+        global _NEXT_REQUEST_NOT_BEFORE, _LAST_RATE_LIMIT
+        _LAST_RATE_LIMIT = {
+            "recordedAt": now,
+            "retryAfterSeconds": retry_after,
+            "xRateLimitDelaySeconds": x_delay,
+            "xRateLimitRemaining": x_remaining,
+            "xRateLimitLimit": x_limit,
+            "xRateLimitReset": x_reset,
+            "xRateLimitCost": x_cost,
+            "xRateLimitResource": x_resource,
+            "appliedDelaySeconds": delay,
+        }
+        if delay > 0:
+            _NEXT_REQUEST_NOT_BEFORE = max(_NEXT_REQUEST_NOT_BEFORE, now + delay)
+
+
+def _wait_for_rate_limit_window() -> None:
+    while True:
+        with _RATE_LIMIT_LOCK:
+            wait_seconds = _NEXT_REQUEST_NOT_BEFORE - time.time()
+        if wait_seconds <= 0:
+            return
+        time.sleep(min(wait_seconds, 1.0))
+
+
+def get_rate_limit_snapshot() -> dict[str, Any] | None:
+    with _RATE_LIMIT_LOCK:
+        if not _LAST_RATE_LIMIT:
+            return None
+        snapshot = dict(_LAST_RATE_LIMIT)
+        snapshot["nextRequestNotBefore"] = _NEXT_REQUEST_NOT_BEFORE
+        snapshot["secondsUntilNextRequest"] = max(0.0, _NEXT_REQUEST_NOT_BEFORE - time.time())
+    return snapshot
 
 
 def _wiql_quote(value: str) -> str:
