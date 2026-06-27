@@ -77,6 +77,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel worker count for phase 5 catalog import. Defaults to BPC_ADO_IMPORT_PARALLEL_WORKERS or 4.",
     )
     parser.add_argument(
+        "--catalog-heartbeat-seconds",
+        default=os.getenv("BPC_ADO_IMPORT_HEARTBEAT_SECONDS", "60"),
+        help="Heartbeat frequency in seconds for phase 5 progress logs. Defaults to BPC_ADO_IMPORT_HEARTBEAT_SECONDS or 60.",
+    )
+    parser.add_argument(
         "--skip-unknown-fields",
         action="store_true",
         help="For phase 5 only: drop fields that do not exist in the target project.",
@@ -183,6 +188,7 @@ def _phase_env(config: AdoSetupConfig, args: argparse.Namespace) -> Dict[str, st
             "BPC_ADO_CATALOG_SOURCE_DIR": args.catalog_source_dir or _default_catalog_source(config.excel_file),
             "BPC_ADO_IMPORT_OUTPUT": args.catalog_output or os.path.join(SCRIPT_DIR, "out"),
             "BPC_ADO_IMPORT_PARALLEL_WORKERS": str(args.catalog_parallel_workers),
+            "BPC_ADO_IMPORT_HEARTBEAT_SECONDS": str(args.catalog_heartbeat_seconds),
             "BPC_ADO_IMPORT_SKIP_UNKNOWN_FIELDS": "1" if args.skip_unknown_fields else "0",
         }
     )

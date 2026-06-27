@@ -25,7 +25,11 @@ def main() -> int:
     )
     output_dir = os.getenv("BPC_ADO_IMPORT_OUTPUT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
     parallel_workers = os.getenv("BPC_ADO_IMPORT_PARALLEL_WORKERS") or "4"
-    progress_seconds = os.getenv("BPC_ADO_IMPORT_PROGRESS_SECONDS") or "60"
+    heartbeat_seconds = (
+        os.getenv("BPC_ADO_IMPORT_HEARTBEAT_SECONDS")
+        or os.getenv("BPC_ADO_IMPORT_PROGRESS_SECONDS")
+        or "60"
+    )
     max_retries = os.getenv("BPC_ADO_IMPORT_MAX_RETRIES") or "8"
     retry_delay_seconds = os.getenv("BPC_ADO_IMPORT_RETRY_DELAY_SECONDS") or "30"
 
@@ -39,7 +43,7 @@ def main() -> int:
         "--output", output_dir,
         "--pat-env", "BPC_ADO_PAT",
         "--parallel-workers", parallel_workers,
-        "--progress-interval-seconds", progress_seconds,
+        "--heartbeat-seconds", heartbeat_seconds,
         "--max-retries", max_retries,
         "--retry-delay-seconds", retry_delay_seconds,
     ]

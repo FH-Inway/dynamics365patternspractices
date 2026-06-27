@@ -13,13 +13,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .ado import AzureDevOpsClient, parse_project_url
+from .ado import AzureDevOpsClient, get_rate_limit_snapshot, parse_project_url
 from .mapping import load_template
 from .sources import find_source_files, load_rows
 from .transform import WorkItemDraft, build_drafts
 
 
 REQUIRED_FIELD_FALLBACKS: dict[str, Any] = {}
+_PROGRESS_LOG_FILE: Path | None = None
+_PROGRESS_LOG_LOCK = threading.Lock()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,7 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     import_parser.add_argument("--dry-run", action="store_true", help="Build API payloads without calling ADO.")
     import_parser.add_argument("--continue-on-error", action="store_true", help="Continue after individual work item failures.")
     import_parser.add_argument("--skip-unknown-fields", action="store_true", help="Drop fields that do not exist in the target project.")
-    import_parser.add_argument("--progress-interval-seconds", type=int, default=60, help="Minimum seconds between progress summaries.")
+    import_parser.add_argument("--heartbeat-seconds", type=int, default=60, help="Heartbeat frequency in seconds for progress summaries.")
+    import_parser.add_argument("--progress-interval-seconds", type=int, default=None, help=argparse.SUPPRESS)
     import_parser.add_argument("--print-created-items", action="store_true", help="Print every created work item. By default the importer prints timed summaries only.")
     import_parser.add_argument("--max-retries", type=int, default=3, help="Retry count for transient create failures.")
     import_parser.add_argument("--retry-delay-seconds", type=float, default=5, help="Base delay between transient create retries.")
@@ -95,6 +98,8 @@ def import_to_ado(args: argparse.Namespace) -> int:
     _normalize_tree_paths(drafts, client.project.project)
     out = _resolve_output_dir(args, client.project)
     out.mkdir(parents=True, exist_ok=True)
+    _set_progress_log_file(out / "import-progress.log")
+    _progress(f"Progress log file: {out / 'import-progress.log'}")
     _write_output_context(out, client.project, args)
     _progress("Writing local import plan and preview files...")
     _write_plan(out / "import-plan.json", drafts)
@@ -112,16 +117,22 @@ def import_to_ado(args: argparse.Namespace) -> int:
 
     id_map: dict[str, int] = _read_id_map(out / "ado-id-map.csv")
     _progress(f"Starting import. {len(id_map)} work item(s) already recorded in {out / 'ado-id-map.csv'}.")
-    reporter = ProgressReporter(len(drafts), len(id_map), args.progress_interval_seconds)
-    failures, payloads = _import_drafts(
-        args=args,
-        drafts=drafts,
-        id_map=id_map,
-        id_map_path=out / "ado-id-map.csv",
-        valid_fields=valid_fields,
-        valid_wits=valid_wits,
-        reporter=reporter,
-    )
+    heartbeat_seconds = int(args.heartbeat_seconds or 60)
+    if args.progress_interval_seconds is not None:
+        heartbeat_seconds = int(args.progress_interval_seconds)
+    reporter = ProgressReporter(len(drafts), len(id_map), heartbeat_seconds)
+    try:
+        failures, payloads = _import_drafts(
+            args=args,
+            drafts=drafts,
+            id_map=id_map,
+            id_map_path=out / "ado-id-map.csv",
+            valid_fields=valid_fields,
+            valid_wits=valid_wits,
+            reporter=reporter,
+        )
+    finally:
+        reporter.stop()
 
     if payloads:
         (out / "dry-run-payloads.json").write_text(json.dumps(payloads, indent=2), encoding="utf-8")
@@ -567,7 +578,24 @@ def _get_pat(env_name: str, dry_run: bool) -> str:
 
 
 def _progress(message: str) -> None:
-    print(f"[bpc-ado-import] {message}", flush=True)
+    line = f"[bpc-ado-import] {message}"
+    print(line, flush=True)
+    with _PROGRESS_LOG_LOCK:
+        path = _PROGRESS_LOG_FILE
+    if path is None:
+        return
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {line}\n")
+    except OSError:
+        pass
+
+
+def _set_progress_log_file(path: Path | None) -> None:
+    with _PROGRESS_LOG_LOCK:
+        global _PROGRESS_LOG_FILE
+        _PROGRESS_LOG_FILE = path
 
 
 def _resolve_output_dir(args: argparse.Namespace, project: Any) -> Path:
@@ -596,7 +624,11 @@ def _write_output_context(out: Path, project: Any, args: argparse.Namespace | No
     }
     if args is not None:
         context["parallelWorkers"] = int(getattr(args, "parallel_workers", 0) or 0)
-        context["progressIntervalSeconds"] = int(getattr(args, "progress_interval_seconds", 0) or 0)
+        heartbeat_seconds = int(getattr(args, "heartbeat_seconds", 0) or 0)
+        if heartbeat_seconds <= 0:
+            heartbeat_seconds = int(getattr(args, "progress_interval_seconds", 0) or 0)
+        context["heartbeatSeconds"] = heartbeat_seconds
+        context["progressIntervalSeconds"] = heartbeat_seconds
         context["maxRetries"] = int(getattr(args, "max_retries", 0) or 0)
         context["retryDelaySeconds"] = float(getattr(args, "retry_delay_seconds", 0) or 0)
     if context_path.exists():
@@ -611,31 +643,103 @@ def _write_output_context(out: Path, project: Any, args: argparse.Namespace | No
 
 
 class ProgressReporter:
-    def __init__(self, total: int, initial_created: int, interval_seconds: int) -> None:
+    def __init__(self, total: int, initial_created: int, heartbeat_seconds: int) -> None:
         self.total = total
         self.start = time.monotonic()
         self.last_report = self.start
         self.initial_created = initial_created
-        self.interval_seconds = max(1, interval_seconds)
+        self.heartbeat_seconds = max(1, heartbeat_seconds)
+        self.last_report_created_or_recorded = initial_created
+        self._latest_checked = initial_created
+        self._latest_created_or_recorded = initial_created
+        self._latest_activity = "starting"
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._heartbeat_loop, name="bpc-ado-heartbeat", daemon=True)
+        self._thread.start()
 
-    def maybe_report(self, checked: int, created_or_recorded: int, activity: str) -> None:
-        now = time.monotonic()
-        if now - self.last_report >= self.interval_seconds or checked == self.total:
-            self.last_report = now
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(self.heartbeat_seconds):
+            with self._state_lock:
+                checked = self._latest_checked
+                created_or_recorded = self._latest_created_or_recorded
+                activity = self._latest_activity
             self.report(checked, created_or_recorded, activity)
 
-    def report(self, checked: int, created_or_recorded: int, activity: str) -> None:
+    def maybe_report(self, checked: int, created_or_recorded: int, activity: str) -> None:
+        with self._state_lock:
+            self._latest_checked = checked
+            self._latest_created_or_recorded = created_or_recorded
+            self._latest_activity = activity
+        if checked == self.total:
+            self.report(checked, created_or_recorded, activity)
+
+    def report(self, checked: int, created_or_recorded: int, activity: str, now: float | None = None) -> None:
+        current_time = now if now is not None else time.monotonic()
         elapsed = max(0.001, time.monotonic() - self.start)
+        elapsed_minutes = elapsed / 60
         created_this_run = max(0, created_or_recorded - self.initial_created)
-        rate = created_this_run / (elapsed / 60)
+        interval_elapsed = max(0.001, current_time - self.last_report)
+        interval_created = max(0, created_or_recorded - self.last_report_created_or_recorded)
+        rate = interval_created / (interval_elapsed / 60)
         remaining = max(0, self.total - checked)
         pct = checked / self.total * 100 if self.total else 100
+        checked_this_run = max(0, checked - self.initial_created)
+        checked_rate_per_min = checked_this_run / elapsed_minutes if elapsed_minutes > 0 else 0.0
+        eta_minutes = (remaining / checked_rate_per_min) if checked_rate_per_min > 0 else None
+        eta_text = _format_eta(eta_minutes)
+        rate_limit_info = _rate_limit_progress_suffix()
         _progress(
             f"Progress: {checked}/{self.total} checked ({pct:.1f}%); "
             f"{created_or_recorded} created or recorded; "
             f"{created_this_run} created this run; "
-            f"{rate:.1f}/min; {remaining} remaining; {activity}."
+            f"{rate:.1f}/min; {remaining} remaining; ETA {eta_text}; {activity}.{rate_limit_info}"
         )
+        self.last_report = current_time
+        self.last_report_created_or_recorded = created_or_recorded
+
+
+def _format_eta(eta_minutes: float | None) -> str:
+    if eta_minutes is None:
+        return "unknown"
+    total_seconds = max(0, int(round(eta_minutes * 60)))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _rate_limit_progress_suffix() -> str:
+    snapshot = get_rate_limit_snapshot()
+    if not snapshot:
+        return " [rate-limit: unavailable]"
+    parts: list[str] = []
+    remaining = snapshot.get("xRateLimitRemaining")
+    limit = snapshot.get("xRateLimitLimit")
+    if remaining is not None and limit is not None:
+        parts.append(f"remaining {remaining}/{limit}")
+    delay = snapshot.get("xRateLimitDelaySeconds")
+    if isinstance(delay, (int, float)) and delay > 0:
+        parts.append(f"header delay {float(delay):.1f}s")
+    retry_after = snapshot.get("retryAfterSeconds")
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        parts.append(f"retry-after {float(retry_after):.1f}s")
+    wait = snapshot.get("secondsUntilNextRequest")
+    if isinstance(wait, (int, float)) and wait > 0:
+        parts.append(f"next request in {float(wait):.1f}s")
+    resource = snapshot.get("xRateLimitResource")
+    if isinstance(resource, str) and resource.strip():
+        parts.append(f"resource {resource.strip()}")
+    if not parts:
+        return " [rate-limit: no headers]"
+    return " [rate-limit: " + ", ".join(parts) + "]"
 
 
 def _normalize_tree_paths(drafts: list[WorkItemDraft], project_name: str) -> None:
