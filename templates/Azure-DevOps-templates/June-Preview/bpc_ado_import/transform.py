@@ -14,6 +14,8 @@ DEFAULTS_BY_REF = {
     "MSBPC.articlestatus": "10 - Not started",
     "MSBPC.businessprocessflowstatus": "10 - Not started",
     "MSBPC.businessprocessflowsource": "Microsoft",
+    "MSBPC.applicationfamily": "Unspecified",
+    "MSBPC.products": "Unspecified",
     "MSBPC.scope": "10 - Unspecified",
     "MSBPC.fitgapstatus": "Unspecified",
     "MSBPC.gapsolutionapproach": "10 - Unspecified",
