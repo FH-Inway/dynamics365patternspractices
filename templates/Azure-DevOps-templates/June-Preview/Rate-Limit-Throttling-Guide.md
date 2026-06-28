@@ -18,6 +18,8 @@ Set these as process environment variables (Run.ps1 already sets recommended val
 | BPC_ADO_IMPORT_SOFT_THROTTLE_THRESHOLD | 0.35 | Soft throttle trigger when remaining/limit drops below threshold. | Soft throttle starts too late. | Throughput is too low with no stalls. |
 | BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS | 3.0 | Maximum proactive sleep added before requests. | Still hitting hard stalls. | Throughput is unnecessarily reduced. |
 | BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT | 0.80 | New trigger: soft throttle also starts when current limit drops below this fraction of initial limit (per resource bucket). | Limit denominator drops quickly before stalls. | Limit denominator is stable and pacing is too conservative. |
+| BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS | 45.0 | Keeps soft throttling easing off gradually after the trigger clears instead of stopping immediately. | Soft throttle drops to zero too abruptly. | You want the importer to resume normal pace faster. |
+| BPC_ADO_IMPORT_SOFT_THROTTLE_LIMIT_DROP_WEIGHT | 1.0 | Scales soft-delay duration by how much current limit dropped versus the baseline max/initial limit. Higher value = stronger delay increase when limits degrade. | You still hit stalls when limit drops sharply (for example limit 110 -> 86). | Soft-throttle spends too much time delaying after moderate limit drops. |
 | BPC_ADO_IMPORT_HEARTBEAT_SECONDS | 60 | Progress heartbeat interval. Observability only, does not change API rate. | You want more frequent status updates. | Log noise is too high. |
 | BPC_ADO_IMPORT_MAX_RETRIES | 8 (wrapper default) | Retry attempts for transient failures. | Intermittent errors recover eventually. | Failures are persistent and should fail fast. |
 
@@ -39,7 +41,17 @@ The importer uses three layers:
 - Tracks initial X-RateLimit-Limit per resource (for example TFS/Short, TFS/Long).
 - If current limit falls below BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT of that initial limit, soft throttling engages even when remaining ratio alone would not trigger early enough.
 
+3b. Delay scaling by limit-drop severity
+- Beyond triggering, soft-delay duration is now increased when current limit is below the resource baseline max/initial limit.
+- Strength is controlled by BPC_ADO_IMPORT_SOFT_THROTTLE_LIMIT_DROP_WEIGHT.
+- This helps when capacity degrades gradually and static delays are not enough to avoid eventual hard stalls.
+
+4. Soft-throttle easing / cooldown
+- When the active trigger clears, the importer does not drop straight back to zero delay.
+- Instead, it eases the delay down over BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS so the bucket has more time to recover.
+
 Effective delay = max(ratio-triggered delay, initial-limit-triggered delay).
+Then, if limit has dropped vs baseline, delay is scaled upward (and capped by BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS).
 
 ## 3) Reading Progress Log Examples
 
@@ -57,17 +69,30 @@ Interpretation:
 ### Example B: Soft throttle active
 
 ```text
-[rate-limit: remaining 37/202, limit 202/206 init (98%), soft delay 0.53s (<35% rem or <80% init limit), resource TFS/Short]
+[rate-limit: remaining 37/202, 18% remaining, limit 202/206 init (98%), soft delay 0.53s (<35% rem or <80% init limit), resource TFS/Short]
 ```
 
 Interpretation:
 - Remaining ratio is low, so the importer slows before exhausting the bucket.
 - Initial limit has not degraded much (98% of initial), so this is mostly ratio-driven pacing.
+- The `x/min` value in the same line is the recent interval rate since the previous progress report.
+- The guide can now show the whole-run average separately as `avg X.X/min total`.
+
+### Example B2: Soft throttle easing off
+
+```text
+[rate-limit: remaining 52/188, 28% remaining, limit 188/206 init (91%), soft delay 0.24s (<35% rem or <80% init limit), cooling down, resource TFS/Long]
+```
+
+Interpretation:
+- The active soft-throttle trigger has cleared, but the importer is still easing off instead of stopping abruptly.
+- This is the cooldown phase driven by BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS.
+- In the progress log, this is reflected by the `cooling down` marker.
 
 ### Example C: Initial-limit degradation warning
 
 ```text
-[rate-limit: remaining 41/152, limit 152/190 init (80%), soft delay ... (<35% rem or <80% init limit), resource TFS/Long]
+[rate-limit: remaining 41/152, 27% remaining, limit 152/190 init (80%), soft delay ... (<35% rem or <80% init limit), resource TFS/Long]
 ```
 
 Interpretation:
@@ -87,6 +112,8 @@ Recommended baseline (current):
 - BPC_ADO_IMPORT_SOFT_THROTTLE_THRESHOLD=0.35
 - BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS=3.0
 - BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT=0.80
+- BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS=45.0
+- BPC_ADO_IMPORT_SOFT_THROTTLE_LIMIT_DROP_WEIGHT=1.0
 
 If hard stalls still appear:
 1. Raise initial limit trigger first:
@@ -112,7 +139,7 @@ If no stalls for a long run and throughput is too low:
 4. Adjust one setting at a time.
 5. Re-run and compare:
 - hard-stall count
-- average created/min
+- recent interval created/min and avg created/min total
 - time spent at 0.0/min
 
 ## 6) Where to Change Values
@@ -125,6 +152,8 @@ Set-EnvValue -Name "BPC_ADO_IMPORT_RETRY_DELAY_SECONDS" -Value "120"
 Set-EnvValue -Name "BPC_ADO_IMPORT_SOFT_THROTTLE_THRESHOLD" -Value "0.35"
 Set-EnvValue -Name "BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS" -Value "3.0"
 Set-EnvValue -Name "BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT" -Value "0.80"
+Set-EnvValue -Name "BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS" -Value "45.0"
+Set-EnvValue -Name "BPC_ADO_IMPORT_SOFT_THROTTLE_LIMIT_DROP_WEIGHT" -Value "1.0"
 ```
 
 Then run setup_wizard.py phase 5 again in the same PowerShell session.
