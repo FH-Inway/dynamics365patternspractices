@@ -16,6 +16,8 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _NEXT_REQUEST_NOT_BEFORE = 0.0
 _LAST_RATE_LIMIT: dict[str, Any] = {}
 _INITIAL_RATE_LIMIT_BY_RESOURCE: dict[str, int] = {}
+_SOFT_THROTTLE_LAST_ACTIVE_AT = 0.0
+_SOFT_THROTTLE_LAST_DELAY = 0.0
 
 
 def _read_env_float(name: str, default: float) -> float:
@@ -28,17 +30,27 @@ def _read_env_float(name: str, default: float) -> float:
         return default
 
 
-def _load_soft_throttle_settings() -> tuple[float, float, float]:
+def _load_soft_throttle_settings() -> tuple[float, float, float, float, float]:
     threshold = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_THRESHOLD", 0.35)
     max_delay = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_MAX_DELAY_SECONDS", 3.0)
     initial_limit_percent = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_INITIAL_LIMIT_PERCENT", 0.80)
+    hold_seconds = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_HOLD_SECONDS", 45.0)
+    limit_drop_weight = _read_env_float("BPC_ADO_IMPORT_SOFT_THROTTLE_LIMIT_DROP_WEIGHT", 1.0)
     threshold = max(0.0, min(1.0, threshold))
     max_delay = max(0.0, max_delay)
     initial_limit_percent = max(0.0, min(1.0, initial_limit_percent))
-    return threshold, max_delay, initial_limit_percent
+    hold_seconds = max(0.0, hold_seconds)
+    limit_drop_weight = max(0.0, min(3.0, limit_drop_weight))
+    return threshold, max_delay, initial_limit_percent, hold_seconds, limit_drop_weight
 
 
-_SOFT_THROTTLE_THRESHOLD, _SOFT_THROTTLE_MAX_DELAY_SECONDS, _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT = _load_soft_throttle_settings()
+(
+    _SOFT_THROTTLE_THRESHOLD,
+    _SOFT_THROTTLE_MAX_DELAY_SECONDS,
+    _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT,
+    _SOFT_THROTTLE_HOLD_SECONDS,
+    _SOFT_THROTTLE_LIMIT_DROP_WEIGHT,
+) = _load_soft_throttle_settings()
 
 
 @dataclass(frozen=True)
@@ -435,8 +447,14 @@ def _record_rate_limit_hints(response: requests.Response) -> None:
     delay = _rate_limit_delay_seconds(response)
     with _RATE_LIMIT_LOCK:
         global _NEXT_REQUEST_NOT_BEFORE, _LAST_RATE_LIMIT, _INITIAL_RATE_LIMIT_BY_RESOURCE
-        if isinstance(x_limit, int) and x_limit > 0 and resource_key and resource_key not in _INITIAL_RATE_LIMIT_BY_RESOURCE:
-            _INITIAL_RATE_LIMIT_BY_RESOURCE[resource_key] = x_limit
+        prev_soft_delay = float(_LAST_RATE_LIMIT.get("softThrottleDelaySeconds") or 0.0)
+        prev_soft_cooling = bool(_LAST_RATE_LIMIT.get("softThrottleCoolingDown"))
+        prev_soft_last_active_at = float(_LAST_RATE_LIMIT.get("softThrottleLastActiveAt") or _SOFT_THROTTLE_LAST_ACTIVE_AT)
+        prev_soft_last_delay = float(_LAST_RATE_LIMIT.get("softThrottleLastDelay") or _SOFT_THROTTLE_LAST_DELAY)
+        if isinstance(x_limit, int) and x_limit > 0 and resource_key:
+            previous_initial = _INITIAL_RATE_LIMIT_BY_RESOURCE.get(resource_key)
+            if not isinstance(previous_initial, int) or x_limit > previous_initial:
+                _INITIAL_RATE_LIMIT_BY_RESOURCE[resource_key] = x_limit
         initial_limit = _INITIAL_RATE_LIMIT_BY_RESOURCE.get(resource_key)
         limit_vs_initial = None
         if isinstance(initial_limit, int) and initial_limit > 0 and isinstance(x_limit, int) and x_limit > 0:
@@ -453,16 +471,45 @@ def _record_rate_limit_hints(response: requests.Response) -> None:
             "xRateLimitCost": x_cost,
             "xRateLimitResource": x_resource,
             "appliedDelaySeconds": delay,
-            "softThrottleDelaySeconds": 0.0,
+            "softThrottleDelaySeconds": prev_soft_delay,
+            "softThrottleCoolingDown": prev_soft_cooling,
             "softThrottleThreshold": _SOFT_THROTTLE_THRESHOLD,
             "softThrottleMaxDelaySeconds": _SOFT_THROTTLE_MAX_DELAY_SECONDS,
             "softThrottleInitialLimitPercent": _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT,
+            "softThrottleHoldSeconds": _SOFT_THROTTLE_HOLD_SECONDS,
+            "softThrottleLastActiveAt": prev_soft_last_active_at,
+            "softThrottleLastDelay": prev_soft_last_delay,
         }
         if delay > 0:
             _NEXT_REQUEST_NOT_BEFORE = max(_NEXT_REQUEST_NOT_BEFORE, now + delay)
 
 
 def _compute_soft_throttle_delay(snapshot: dict[str, Any]) -> float:
+    active_delay = _compute_active_soft_throttle_delay(snapshot)
+    if active_delay > 0:
+        return active_delay
+
+    if _SOFT_THROTTLE_HOLD_SECONDS <= 0:
+        return 0.0
+
+    last_active_at = snapshot.get("softThrottleLastActiveAt")
+    last_delay = snapshot.get("softThrottleLastDelay")
+    if not isinstance(last_active_at, (int, float)) or not isinstance(last_delay, (int, float)):
+        return 0.0
+    if last_delay <= 0:
+        return 0.0
+
+    elapsed_since_active = time.time() - float(last_active_at)
+    if elapsed_since_active < 0:
+        return 0.0
+    if elapsed_since_active >= _SOFT_THROTTLE_HOLD_SECONDS:
+        return 0.0
+
+    remaining_fraction = 1.0 - (elapsed_since_active / _SOFT_THROTTLE_HOLD_SECONDS)
+    return max(0.0, float(last_delay) * remaining_fraction)
+
+
+def _compute_active_soft_throttle_delay(snapshot: dict[str, Any]) -> float:
     if _SOFT_THROTTLE_THRESHOLD <= 0 or _SOFT_THROTTLE_MAX_DELAY_SECONDS <= 0:
         return 0.0
 
@@ -489,7 +536,18 @@ def _compute_soft_throttle_delay(snapshot: dict[str, Any]) -> float:
             drop_pressure = max(0.0, min(1.0, drop_pressure))
             initial_limit_delay = _SOFT_THROTTLE_MAX_DELAY_SECONDS * max(0.15, drop_pressure)
 
-    return max(ratio_delay, initial_limit_delay)
+    active_delay = max(ratio_delay, initial_limit_delay)
+    if active_delay <= 0:
+        return 0.0
+
+    if isinstance(initial_limit, int) and initial_limit > 0 and _SOFT_THROTTLE_LIMIT_DROP_WEIGHT > 0:
+        # When the observed limit drops versus the baseline max for this resource,
+        # proportionally increase delay duration to ease pressure for longer.
+        limit_drop_fraction = max(0.0, min(1.0, (initial_limit - limit) / initial_limit))
+        if limit_drop_fraction > 0:
+            active_delay *= 1.0 + (limit_drop_fraction * _SOFT_THROTTLE_LIMIT_DROP_WEIGHT)
+
+    return min(_SOFT_THROTTLE_MAX_DELAY_SECONDS, active_delay)
 
 
 def _wait_for_rate_limit_window() -> None:
@@ -502,18 +560,32 @@ def _wait_for_rate_limit_window() -> None:
 
 
 def _wait_for_soft_throttle_window() -> None:
+    now = time.time()
     with _RATE_LIMIT_LOCK:
         snapshot = dict(_LAST_RATE_LIMIT) if _LAST_RATE_LIMIT else None
     if not snapshot:
         return
 
+    active_delay = _compute_active_soft_throttle_delay(snapshot)
     delay = _compute_soft_throttle_delay(snapshot)
     with _RATE_LIMIT_LOCK:
         if _LAST_RATE_LIMIT:
+            if active_delay > 0:
+                global _SOFT_THROTTLE_LAST_ACTIVE_AT, _SOFT_THROTTLE_LAST_DELAY
+                _SOFT_THROTTLE_LAST_ACTIVE_AT = now
+                _SOFT_THROTTLE_LAST_DELAY = active_delay
+            cooldown_remaining = 0.0
+            if _SOFT_THROTTLE_HOLD_SECONDS > 0 and _SOFT_THROTTLE_LAST_ACTIVE_AT > 0:
+                cooldown_remaining = max(0.0, _SOFT_THROTTLE_HOLD_SECONDS - (now - _SOFT_THROTTLE_LAST_ACTIVE_AT))
             _LAST_RATE_LIMIT["softThrottleDelaySeconds"] = delay
+            _LAST_RATE_LIMIT["softThrottleCoolingDown"] = active_delay <= 0 and cooldown_remaining > 0
+            _LAST_RATE_LIMIT["softThrottleCooldownRemainingSeconds"] = cooldown_remaining
             _LAST_RATE_LIMIT["softThrottleThreshold"] = _SOFT_THROTTLE_THRESHOLD
             _LAST_RATE_LIMIT["softThrottleMaxDelaySeconds"] = _SOFT_THROTTLE_MAX_DELAY_SECONDS
             _LAST_RATE_LIMIT["softThrottleInitialLimitPercent"] = _SOFT_THROTTLE_INITIAL_LIMIT_PERCENT
+            _LAST_RATE_LIMIT["softThrottleHoldSeconds"] = _SOFT_THROTTLE_HOLD_SECONDS
+            _LAST_RATE_LIMIT["softThrottleLastActiveAt"] = _SOFT_THROTTLE_LAST_ACTIVE_AT
+            _LAST_RATE_LIMIT["softThrottleLastDelay"] = _SOFT_THROTTLE_LAST_DELAY
     if delay > 0:
         time.sleep(delay)
 

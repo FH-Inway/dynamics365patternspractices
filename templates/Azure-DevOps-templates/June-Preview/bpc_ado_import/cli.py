@@ -22,6 +22,11 @@ from .transform import WorkItemDraft, build_drafts
 REQUIRED_FIELD_FALLBACKS: dict[str, Any] = {}
 _PROGRESS_LOG_FILE: Path | None = None
 _PROGRESS_LOG_LOCK = threading.Lock()
+_CONSOLE_COLOR_ENABLED = sys.stdout.isatty() and os.getenv("NO_COLOR", "").strip() == ""
+_ANSI_RESET = "\x1b[0m"
+_ANSI_BOLD = "\x1b[1m"
+_ANSI_YELLOW = "\x1b[33m"
+_ANSI_RED = "\x1b[31m"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -579,7 +584,8 @@ def _get_pat(env_name: str, dry_run: bool) -> str:
 
 def _progress(message: str) -> None:
     line = f"[bpc-ado-import] {message}"
-    print(line, flush=True)
+    prefixed_line = _prefix_progress_line(line)
+    print(_highlight_progress_line(prefixed_line), flush=True)
     with _PROGRESS_LOG_LOCK:
         path = _PROGRESS_LOG_FILE
     if path is None:
@@ -587,9 +593,46 @@ def _progress(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp} {line}\n")
+            handle.write(f"{timestamp} {prefixed_line}\n")
     except OSError:
         pass
+
+
+def _highlight_progress_line(line: str) -> str:
+    if not _CONSOLE_COLOR_ENABLED:
+        return line
+
+    severity = _progress_line_severity(line)
+    if severity is None:
+        return line
+
+    if severity == "stall":
+        return f"{_ANSI_BOLD}{_ANSI_RED}{line}{_ANSI_RESET}"
+    if severity == "caution":
+        return f"{_ANSI_BOLD}{_ANSI_YELLOW}{line}{_ANSI_RESET}"
+    return line
+
+
+def _prefix_progress_line(line: str) -> str:
+    if "[rate-limit:" not in line:
+        return line
+    if "next request in" in line or "retry-after" in line or "remaining 0/" in line:
+        return f"STALL: {line}"
+    if "soft delay" in line:
+        return f"CAUTION: {line}"
+    return line
+
+
+def _progress_line_severity(line: str) -> str | None:
+    if "[rate-limit:" not in line:
+        return None
+    if "next request in" in line or "retry-after" in line:
+        return "stall"
+    if "soft delay" in line:
+        return "caution"
+    if "remaining 0/" in line:
+        return "stall"
+    return None
 
 
 def _set_progress_log_file(path: Path | None) -> None:
@@ -689,6 +732,7 @@ class ProgressReporter:
         remaining = max(0, self.total - checked)
         pct = checked / self.total * 100 if self.total else 100
         checked_this_run = max(0, checked - self.initial_created)
+        total_rate_per_min = created_this_run / elapsed_minutes if elapsed_minutes > 0 else 0.0
         checked_rate_per_min = checked_this_run / elapsed_minutes if elapsed_minutes > 0 else 0.0
         eta_minutes = (remaining / checked_rate_per_min) if checked_rate_per_min > 0 else None
         eta_text = _format_eta(eta_minutes)
@@ -697,7 +741,7 @@ class ProgressReporter:
             f"Progress: {checked}/{self.total} checked ({pct:.1f}%); "
             f"{created_or_recorded} created or recorded; "
             f"{created_this_run} created this run; "
-            f"{rate:.1f}/min; {remaining} remaining; ETA {eta_text}; {activity}.{rate_limit_info}"
+            f"{rate:.1f}/min; avg {total_rate_per_min:.1f}/min total; {remaining} remaining; ETA {eta_text}; {activity}.{rate_limit_info}"
         )
         self.last_report = current_time
         self.last_report_created_or_recorded = created_or_recorded
@@ -724,7 +768,9 @@ def _rate_limit_progress_suffix() -> str:
     remaining = snapshot.get("xRateLimitRemaining")
     limit = snapshot.get("xRateLimitLimit")
     if remaining is not None and limit is not None:
-        parts.append(f"remaining {remaining}/{limit}")
+        if isinstance(remaining, int) and isinstance(limit, int) and limit > 0:
+            remaining_pct = max(0, min(100, int(round((remaining / limit) * 100))))
+        parts.append(f"remaining {remaining}/{limit} ({remaining_pct}%)")
     delay = snapshot.get("xRateLimitDelaySeconds")
     if isinstance(delay, (int, float)) and delay > 0:
         parts.append(f"header delay {float(delay):.1f}s")
@@ -735,6 +781,8 @@ def _rate_limit_progress_suffix() -> str:
     if isinstance(wait, (int, float)) and wait > 0:
         parts.append(f"next request in {float(wait):.1f}s")
     soft_delay = snapshot.get("softThrottleDelaySeconds")
+    cooling_down = snapshot.get("softThrottleCoolingDown")
+    cooldown_remaining = snapshot.get("softThrottleCooldownRemainingSeconds")
     soft_threshold = snapshot.get("softThrottleThreshold")
     initial_limit = snapshot.get("xRateLimitInitialLimit")
     limit_vs_initial = snapshot.get("xRateLimitLimitVsInitial")
@@ -754,6 +802,16 @@ def _rate_limit_progress_suffix() -> str:
                 parts.append(f"soft delay {float(soft_delay):.2f}s (<{float(soft_threshold) * 100:.0f}% rem)")
         else:
             parts.append(f"soft delay {float(soft_delay):.2f}s")
+        if cooling_down:
+            if isinstance(cooldown_remaining, (int, float)) and cooldown_remaining > 0:
+                parts.append(f"cooling down {float(cooldown_remaining):.0f}s")
+            else:
+                parts.append("cooling down")
+    elif cooling_down:
+        if isinstance(cooldown_remaining, (int, float)) and cooldown_remaining > 0:
+            parts.append(f"cooling down {float(cooldown_remaining):.0f}s")
+        else:
+            parts.append("cooling down")
     resource = snapshot.get("xRateLimitResource")
     if isinstance(resource, str) and resource.strip():
         parts.append(f"resource {resource.strip()}")
